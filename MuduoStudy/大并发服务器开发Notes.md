@@ -1433,6 +1433,192 @@ int main()
    }
    ```
 
+## net库源码分析
+
+### 一：TCP网络编程本质
+
+![image-20210818200938154](大并发服务器开发Notes.assets/image-20210818200938154.png)
+
+**对于高流量服务：可能内核缓冲区无法一次性接受完毕一条消息**
+
+**一个套接字有两个缓冲区：**
+
+- 接收缓冲区
+- 发送缓冲区
+
+#### **IO事件响应流程**
+
+![image-20210818201158489](大并发服务器开发Notes.assets/image-20210818201158489.png)
+
+1. 当一个套接字有数据到来的时候，先被内核接受，接收到内核缓冲区
+
+2. 网络库的可读事件触发
+
+3. 将数据从内核缓冲区，移动到应用层缓冲区
+
+4. 回调注册的函数`OnMessage`
+
+   > 要根据协议判断是否是一个完整的数据包。
+   >
+   > 如果不是一个完整的数据包，OnMessage立即返回。等待其他的数据到来。
+   >
+   > 当内核缓冲区有新的数据到来，就添加到应用层缓冲区。调用OnMessage
+   >
+   > 应用层缓冲区判断是否是一个完整的数据包。是的话，则
+   >
+   > - read
+   > - decode
+   > - compute
+   > - encode
+   > - write
+   >
+   > **继续以上逻辑**
+
+#### muduo网络库用于实现EchoServer
+
+![image-20210818201523311](大并发服务器开发Notes.assets/image-20210818201523311.png)
+
+#### EventLoop封装
+
+muduo的模型是one loop per thread,对于多个线程，则存在multiple reactors
+
+![image-20210818201859089](大并发服务器开发Notes.assets/image-20210818201859089.png)
+
+```c++
+namespace tmuduo
+{
+// 当前线程EventLoop对象指针
+// 线程局部存储
+__thread EventLoop* t_loopInThisThread = 0;  
+// __thread关键字：每个线程都有一份数据
+}
+
+EventLoop* EventLoop::getEventLoopOfCurrentThread()
+{
+  return t_loopInThisThread;
+}
+
+EventLoop::EventLoop()
+  : looping_(false),
+    threadId_(CurrentThread::tid())
+{
+  LOG_TRACE << "EventLoop created " << this << " in thread " << threadId_;
+  // 如果当前线程已经创建了EventLoop对象，终止(LOG_FATAL)
+  if (t_loopInThisThread)
+  {
+    LOG_FATAL << "Another EventLoop " << t_loopInThisThread
+              << " exists in this thread " << threadId_;
+  }
+  else
+  {
+    t_loopInThisThread = this;
+  }
+}
+
+EventLoop::~EventLoop()
+{
+  t_loopInThisThread = NULL;
+}
+
+// 事件循环，该函数不能跨线程调用
+// 只能在创建该对象的线程中调用
+void EventLoop::loop()
+{
+  assert(!looping_);
+  // 断言当前处于创建该对象的线程中
+  assertInLoopThread();
+  looping_ = true;
+  LOG_TRACE << "EventLoop " << this << " start looping";
+
+  ::poll(NULL, 0, 5*1000); // 等待5s，未关注任何事件
+
+  LOG_TRACE << "EventLoop " << this << " stop looping";
+  looping_ = false;
+}
+
+void EventLoop::abortNotInLoopThread() 
+// 终止程序
+{
+  LOG_FATAL << "EventLoop::abortNotInLoopThread - EventLoop " << this
+            << " was created in threadId_ = " << threadId_
+            << ", current thread id = " <<  CurrentThread::tid();
+}
+```
+
+**跨线程调用出错示例：**
+
+```c++
+#include <muduo/net/EventLoop.h>
+
+#include <stdio.h>
+
+using namespace muduo;
+using namespace muduo::net;
+
+EventLoop* g_loop;
+
+void threadFunc()
+{
+	g_loop->loop(); // 跨线程调用，会出错
+}
+
+int main(void)
+{
+	EventLoop loop;
+	g_loop = &loop;
+	Thread t(threadFunc);
+	t.start();
+	t.join();
+	return 0;
+}
+```
+
+### 二：muduo网络库类图
+
+![image-20210818211251022](大并发服务器开发Notes.assets/image-20210818211251022.png)
+
+![image-20210818211426797](大并发服务器开发Notes.assets/image-20210818211426797.png)
+
+1. Poller：封装了IO复用
+
+   - PollPoller：继承自Poller，封装poll
+   - EpollPoller：继承自Poller，封装epoll
+
+2. Channel：对I/O事件的注册与响应的封装
+
+   - update：注册和更新
+   - handleEvent：对所发生的的I/O事件做出处理
+     - 当调用channel的handleEvent的时候，会调用EventLoop的updateChannel，从而调用Poller的updateChannel
+     - 相当于将Channel的文件描述符的可读可写事件注册到Poller当中
+
+   - 不拥有文件描述符，channel销毁的时候，不关闭fd（**关联关系**）
+
+3. EventLoop：
+
+   - 一个EventLoop可以包含多个Channel对象。（一对多的，聚合关系）不负责channel的生命周期。**由Acceptor、TcpConnection、Connector负责**
+
+4. FileDescriptor的生命周期由套接字管理
+
+5. Acceptor是对被动连接的抽象，通过`handleRead()`**关注监听套接字的可读事件**
+
+   - **由channel注册**，调用channel的handleEvent，回调了handleRead()
+
+6. connector对主动连接的抽象。
+
+7. **一旦被动连接或者主动连接建立，会创建一个TCPCONNECTION对象。**
+
+   > 对已连接套接字socket的抽象
+
+8. TCPServer会包含一个Acceptor，组合关系。符合Acceptor的生命周期
+
+   - 一个TcpServer包含多个TcpConnection，但是不负责TcpConnection的生命周期
+
+![image-20210818211614456](大并发服务器开发Notes.assets/image-20210818211614456.png)
+
+![image-20210818215832410](大并发服务器开发Notes.assets/image-20210818215832410.png)
+
+
+
 # 总结
 
 ## 信号、错误处理
@@ -1529,6 +1715,46 @@ write：将应用层缓冲区数据拷贝到内核缓冲区。并不代表发送
    **代码示例：**
 
    ![image-20210811095120136](大并发服务器开发Notes.assets/image-20210811095120136.png)
+
+### IO复用的事件信号
+
+![image-20210818212929396](大并发服务器开发Notes.assets/image-20210818212929396.png)
+
+```c
+void Channel::handleEventWithGuard(Timestamp receiveTime) // 事件处理函数
+{
+  eventHandling_ = true;
+  if ((revents_ & POLLHUP) && !(revents_ & POLLIN))
+  {
+    if (logHup_)
+    {
+      LOG_WARN << "Channel::handle_event() POLLHUP";
+    }
+    if (closeCallback_) closeCallback_();
+  }
+
+  if (revents_ & POLLNVAL)
+  {
+    LOG_WARN << "Channel::handle_event() POLLNVAL";
+  }
+
+  if (revents_ & (POLLERR | POLLNVAL))
+  {
+    if (errorCallback_) errorCallback_();
+  }
+  if (revents_ & (POLLIN | POLLPRI | POLLRDHUP))
+  {
+    if (readCallback_) readCallback_(receiveTime);
+  }
+  if (revents_ & POLLOUT)
+  {
+    if (writeCallback_) writeCallback_();
+  }
+  eventHandling_ = false;
+}
+```
+
+
 
 ## 套接字超时设置
 

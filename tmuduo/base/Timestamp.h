@@ -61,7 +61,7 @@ inline bool operator<(Timestamp lhs, Timestamp rhs)
 // @param high, low
 // @return (high - low) in seconds
 //
-inline double timeDifference(const Timestamp &high, const Timestamp &low) // passed by const reference
+inline double timeDifference(const Timestamp high, const Timestamp low) // passed by const reference
 {
     int64_t diff = high.microSecondsSinceEpoch() - low.microSecondsSinceEpoch();
 
@@ -69,7 +69,7 @@ inline double timeDifference(const Timestamp &high, const Timestamp &low) // pas
 }
 
 // add seconds to given timestamp
-inline Timestamp addTime(Timestamp &timestamp, double seconds)
+inline Timestamp addTime(Timestamp timestamp, double seconds)
 {
     int64_t delta = static_cast<int64_t>(seconds * Timestamp::kMicroSecondsPerSecond);
 

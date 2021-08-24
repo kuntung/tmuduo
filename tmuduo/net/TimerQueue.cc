@@ -119,22 +119,22 @@ TimerId TimerQueue::addTimer(const TimerCallback& cb,
                              double interval)
 {
   Timer* timer = new Timer(cb, when, interval);
-  /*
+  
   loop_->runInLoop(
       boost::bind(&TimerQueue::addTimerInLoop, this, timer));
-	  */
-  addTimerInLoop(timer); // 这时候的addTimer无法实现跨线程调用
+	  
+  // addTimerInLoop(timer); // 这时候的addTimer无法实现跨线程调用
   						// 因为addTimerInLoop会断言失败
   return TimerId(timer, timer->sequence());
 }
 
 void TimerQueue::cancel(TimerId timerId)
 {
-  /*
+  
   loop_->runInLoop(
       boost::bind(&TimerQueue::cancelInLoop, this, timerId));
-	  */
-  cancelInLoop(timerId);
+
+ // cancelInLoop(timerId);
 }
 
 void TimerQueue::addTimerInLoop(Timer* timer)

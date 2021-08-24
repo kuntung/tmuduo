@@ -40,8 +40,8 @@ Channel::~Channel()
 
 void Channel::tie(const boost::shared_ptr<void>& obj)
 {
-  tie_ = obj;
-  tied_ = true;
+	tie_ = obj;
+	tied_ = true;
 }
 
 void Channel::update()
@@ -64,7 +64,9 @@ void Channel::handleEvent(Timestamp receiveTime)
     guard = tie_.lock();
     if (guard)
     {
+	  LOG_TRACE << "[6] usecount=" << guard.use_count();
       handleEventWithGuard(receiveTime);
+	  LOG_TRACE << "[7] usecount=" << guard.use_count();
     }
   }
   else

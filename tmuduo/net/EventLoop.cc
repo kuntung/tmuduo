@@ -15,6 +15,8 @@
 
 //#include <poll.h>
 
+#include <boost/bind.hpp> // for boost::bind
+#include <sys/eventfd.h> // for wake up fd
 using namespace tmuduo;
 using namespace tmuduo::net;
 
@@ -27,6 +29,19 @@ __thread EventLoop* t_loopInThisThread = 0;
 const int kPollTimeMs = 10000;
 }
 
+// createEventFd()
+int createEventFd()
+{
+	int evtfd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	if (evtfd < 0)
+	{
+		LOG_SYSERR << "Failed in eventfd";
+		abort();
+	}
+
+	return evtfd;
+}
+
 EventLoop* EventLoop::getEventLoopOfCurrentThread()
 {
   return t_loopInThisThread;
@@ -36,9 +51,12 @@ EventLoop::EventLoop()
   : looping_(false),
     quit_(false),
     eventHandling_(false),
+	callingPendingFunctors_(false),
     threadId_(CurrentThread::tid()),
 	poller_(Poller::newDefaultPoller(this)),
     timerQueue_(new TimerQueue(this)),
+	wakeupFd_(createEventFd()),
+	wakeupChannel_(new Channel(this, wakeupFd_)),
 	currentActiveChannel_(NULL)
 {
   LOG_TRACE << "EventLoop created " << this << " in thread " << threadId_;
@@ -52,10 +70,17 @@ EventLoop::EventLoop()
   {
     t_loopInThisThread = this;
   }
+
+  wakeupChannel_->setReadCallback(
+  		boost::bind(&EventLoop::handleRead, this)); // 当这个通道响应的时候，应该去doPendingFunctors
+		
+  wakeupChannel_->enableReading(); // 加入关注
+
 }
 
 EventLoop::~EventLoop()
 {
+  ::close(wakeupFd_); // 只负责这一个文件描述符的生命你该周期
   t_loopInThisThread = NULL;
 }
 
@@ -89,21 +114,91 @@ void EventLoop::loop()
     }
     currentActiveChannel_ = NULL;
     eventHandling_ = false;
-    //doPendingFunctors();
+    doPendingFunctors();
   }
 
   LOG_TRACE << "EventLoop " << this << " stop looping";
   looping_ = false;
 }
 
-// 该函数可以跨线程调用
+// 该函数可以跨线程调用:g_loop->quit()
 void EventLoop::quit()
 {
   quit_ = true;
   if (!isInLoopThread())
   {
-    //wakeup();
+    wakeup();
   }
+}
+
+// runInLoop：在IO线程中执行某个添加的回调函数，该函数可以跨线程调用
+void EventLoop::runInLoop(const Functor& cb)
+{
+	if (isInLoopThread())
+	{
+		cb(); // 如果是当前IO线程调用runInLoop，则同步调用cb
+	}
+	else
+	{
+		queueInLoop(cb); // 否则，将该cb添加到队列，等待poll返回执行
+	}
+
+}
+
+void EventLoop::queueInLoop(const Functor& cb)
+{
+	{
+		MutexLockGuard lock(mutex_);
+		pendingFunctors_.push_back(cb); // 互斥的访问临界资源pendingFunctors_
+	}
+	// 只有IO线程的事件回调中调用queueInLoop才不需要唤醒
+	if (!isInLoopThread() || callingPendingFunctors_)
+	{
+		// callingPendingFunctors_ = true表示当前IO线程正在执行pendingFunctor
+		wakeup();
+	}
+}
+
+void EventLoop::wakeup()
+{
+	uint64_t one = 1; // 因为eventfd包含一个64位的integer
+
+	ssize_t n = ::write(wakeupFd_, &one, sizeof one);
+
+	if (n != sizeof one)
+	{
+		LOG_ERROR << "EventLoop::wakeup() writes " << n << " bytes instead of 8.";
+	}
+}
+
+void EventLoop::handleRead() // wakeupChannel注册的回调函数，读走写入的8个字节。为了避免busy-loop
+{
+	uint64_t one = 1;
+
+	ssize_t n = ::read(wakeupFd_, &one, sizeof one);
+
+	if (n != sizeof one)
+	{
+		LOG_ERROR << "EventLoop::handleRead() reads " << n << " bytes instead of 8.";
+	}
+}
+
+void EventLoop::doPendingFunctors()
+{
+	std::vector<Functor> functors;
+	callingPendingFunctors_ = true; // 表明当前处于自定义事件的处理状态
+
+	{
+		MutexLockGuard lock(mutex_); // 保护临界区
+		functors.swap(pendingFunctors_);
+	}
+
+	for (size_t i = 0; i < functors.size(); ++i)
+	{
+		functors[i]();
+	}
+
+	callingPendingFunctors_ = false;
 }
 
 TimerId EventLoop::runAt(const Timestamp& time, const TimerCallback& cb)

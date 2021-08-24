@@ -52,7 +52,7 @@ class Channel : boost::noncopyable
 
   /// Tie this channel to the owner object managed by shared_ptr,
   /// prevent the owner object being destroyed in handleEvent.
-  void tie(const boost::shared_ptr<void>&);
+  void tie(const boost::shared_ptr<void>&); // 用于TcpConnection生存期管理
 
   int fd() const { return fd_; }
   int events() const { return events_; }

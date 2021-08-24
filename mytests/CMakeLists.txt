@@ -35,3 +35,32 @@ target_link_libraries(reactor_test03.1 tmuduo_net)
 # eventloop关注定时器事件
 add_executable(reactor_test4 Reactor_test04.cc)
 target_link_libraries(reactor_test4 tmuduo_net)
+
+# 支持向IO线程添加事件的runInLoop测试
+add_executable(reactor_test05 Reactor_test05.cc)
+target_link_libraries(reactor_test05 tmuduo_net)
+
+
+# 测试EventLoopThread
+add_executable(reactor_test06 Reactor_test06.cc)
+target_link_libraries(reactor_test06 tmuduo_net)
+
+
+# 测试Acceptor，socket和地址
+add_executable(reactor_test07 Reactor_test07.cc)
+target_link_libraries(reactor_test07 tmuduo_net)
+
+
+# 测试TcpServer的业务逻辑
+## 不封装TestServer
+add_executable(reactor_test08 Reactor_test08.cc)
+target_link_libraries(reactor_test08 tmuduo_net)
+
+## 封装了TestServer
+add_executable(reactor_test09 Reactor_test09.cc)
+target_link_libraries(reactor_test09 tmuduo_net)
+
+
+# multiple reactors测试
+add_executable(reactor_test10 Reactor_test10.cc)
+target_link_libraries(reactor_test10 tmuduo_net)

@@ -21,8 +21,8 @@ TcpServer::TcpServer(EventLoop* loop,
 	name_(nameArg),
 	acceptor_(new Acceptor(loop, listenAddr)),
 	threadPool_(new EventLoopThreadPool(loop)),
-	/* connectionCallback_(defaultConnectionCallback),
-	 messageCallback_(defaultMessageCallback), */
+	connectionCallback_(defaultConnectionCallback),
+	 messageCallback_(defaultMessageCallback),
 	started_(false),
 	nextConnId_(1)
 {
@@ -105,6 +105,7 @@ void TcpServer::newConnection(int sockfd, const InetAddress& peerAddr)
 	LOG_TRACE << "[2] usecount=" << conn.use_count();
 	conn->setConnectionCallback(connectionCallback_); // ?
 	conn->setMessageCallback(messageCallback_);
+	conn->setWriteCompleteCallback(writeCompleteCallback_);
 
 	conn->setCloseCallback(
 		boost::bind(&TcpServer::removeConnection, this, _1)); // 这里可能也涉及到IO线程跨线程调用,提供一个

@@ -62,6 +62,10 @@ public:
 	void setMessageCallback(const MessageCallback& cb)
 	{ messageCallback_ = cb; }
 
+	// 消息发送完毕事件回调函数
+	void setWriteCompleteCallback(const WriteCompleteCallback& cb)
+	{	writeCompleteCallback_ = cb; }
+
 private:
 	
 	// Not thread safe, but in loop
@@ -81,6 +85,7 @@ private:
 
 	ConnectionCallback connectionCallback_;
 	MessageCallback messageCallback_;
+	WriteCompleteCallback writeCompleteCallback_;
 	ThreadInitCallback threadInitCallback_;
 	bool started_;
 

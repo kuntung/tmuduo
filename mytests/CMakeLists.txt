@@ -1,7 +1,3 @@
-#set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "../build/debug/mytests/") add_executable(testThreadOO Thread_OO.cpp Thread.cpp)
-#target_link_libraries(testThreadOO pthread)
-
-
 add_executable(testThreadBO Thread_BO.cpp ThreadBO.cpp)
 target_link_libraries(testThreadBO pthread)
 
@@ -50,17 +46,25 @@ target_link_libraries(reactor_test06 tmuduo_net)
 add_executable(reactor_test07 Reactor_test07.cc)
 target_link_libraries(reactor_test07 tmuduo_net)
 
+# 完整的TcpServer测试，封装了Buffer
+## 输出100个A，200个B给对等方
+add_executable(reactor_test12 Reactor_test12.cc)
+target_link_libraries(reactor_test12 tmuduo_net)
 
-# 测试TcpServer的业务逻辑
-## 不封装TestServer
-add_executable(reactor_test08 Reactor_test08.cc)
-target_link_libraries(reactor_test08 tmuduo_net)
+### chagen测试
+add_executable(reactor_test13 Reactor_test13.cc)
+target_link_libraries(reactor_test13 tmuduo_net)
 
-## 封装了TestServer
-add_executable(reactor_test09 Reactor_test09.cc)
-target_link_libraries(reactor_test09 tmuduo_net)
-
-
-# multiple reactors测试
-add_executable(reactor_test10 Reactor_test10.cc)
-target_link_libraries(reactor_test10 tmuduo_net)
+## 测试TcpServer的业务逻辑
+### 不封装TestServer
+#add_executable(reactor_test08 Reactor_test08.cc)
+#target_link_libraries(reactor_test08 tmuduo_net)
+#
+### 封装了TestServer
+#add_executable(reactor_test09 Reactor_test09.cc)
+#target_link_libraries(reactor_test09 tmuduo_net)
+#
+#
+## multiple reactors测试
+#add_executable(reactor_test10 Reactor_test10.cc)
+#target_link_libraries(reactor_test10 tmuduo_net)

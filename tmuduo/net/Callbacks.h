@@ -9,7 +9,7 @@ namespace tmuduo
 {
 namespace net
 {
-
+class Buffer;
 class TcpConnection;
 
 typedef boost::shared_ptr<TcpConnection> TcpConnectionPtr;
@@ -21,8 +21,16 @@ typedef boost::function<void(const TcpConnectionPtr&)> ConnectionCallback; // è¿
 typedef boost::function<void(const TcpConnectionPtr&)> CloseCallback;
 
 typedef boost::function<void (const TcpConnectionPtr&,
-							  const char* data,
-							  ssize_t len)> MessageCallback;
+							  Buffer*,
+							  Timestamp)> MessageCallback;
+
+typedef boost::function<void (const TcpConnectionPtr&)> WriteCompleteCallback;
+typedef boost::function<void (const TcpConnectionPtr&, size_t)> HighWaterMarkCallback;
+
+void defaultConnectionCallback(const TcpConnectionPtr& conn);
+void defaultMessageCallback(const TcpConnectionPtr& conn,
+					Buffer* buffer,
+					Timestamp receiveTime);
 } // end of net
 
 } // end of tmuduo

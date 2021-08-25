@@ -1590,12 +1590,17 @@ int main(void)
    - handleEvent：对所发生的的I/O事件做出处理
      - 当调用channel的handleEvent的时候，会调用EventLoop的updateChannel，从而调用Poller的updateChannel
      - 相当于将Channel的文件描述符的可读可写事件注册到Poller当中
-
    - 不拥有文件描述符，channel销毁的时候，不关闭fd（**关联关系**）
+   - **channel的类型**
+     - wakeupchannel
+     - timerqueue的channel
+     - TCP连接的channel
 
 3. EventLoop：
 
    - 一个EventLoop可以包含多个Channel对象。（一对多的，聚合关系）不负责channel的生命周期。**由Acceptor、TcpConnection、Connector负责**
+   - 但是要负责IO线程唤醒的 ` boost::scoped_ptr<Channel> wakeupChannel_;	// 该通道将会纳入poller_来管理`的生命期管理
+   - 组合关系
 
 4. FileDescriptor的生命周期由套接字管理
 
@@ -1617,6 +1622,910 @@ int main(void)
 
 ![image-20210818215832410](大并发服务器开发Notes.assets/image-20210818215832410.png)
 
+### 三：定时器函数选择，让EventLoop能够处理定时器事件
+
+![image-20210819092328355](大并发服务器开发Notes.assets/image-20210819092328355.png)
+
+![image-20210819092457681](大并发服务器开发Notes.assets/image-20210819092457681.png)
+
+```c
+#include <sys/signalfd.h>
+
+int signalfd(int fd, const sigset_t *mask, int flags);
+```
+
+**所选的timerfd的相关函数**
+
+```c++
+#include <sys/timerfd.h>
+
+int timerfd_create(int clockid, int flags);
+
+/*
+1. clockid:定时器类型，
+	- CLOCK_REALTIME：setable system-wide clock
+	- CLOCK_MONOTONIC：not setable，即无法通过手动更改系统时间提前触发
+2. flags:创建选项
+	- TFD_NONBLOCK:非阻塞的文件描述符
+	- TFD_CLOEXEC：文件描述符在exec的时候不会被继承
+3. return value：创建的文件描述符
+*/
+
+// 设定定时器
+int timerfd_settime(int fd, int flags,
+                    const struct itimerspec *new_value,
+                    struct itimerspec *old_value);
+
+// new_value：新的超时时间，原来的超时时间old_value
+struct timespec {
+    time_t tv_sec;                /* Seconds */
+    long   tv_nsec;               /* Nanoseconds */
+};
+
+struct itimerspec {
+    struct timespec it_interval;  /* Interval for periodic timer */
+    // interval设置为0，表明是一次性的定时器
+    struct timespec it_value;     /* Initial expiration */
+};
+
+```
+
+### Poller类的分析
+
+#### Poller抽象类
+
+**头文件声明：**
+
+```c++
+class Poller : boost::noncopyable
+{
+ public:
+  typedef std::vector<Channel*> ChannelList;
+
+  Poller(EventLoop* loop);
+  virtual ~Poller();
+
+  /// Polls the I/O events.
+  /// Must be called in the loop thread.
+  virtual Timestamp poll(int timeoutMs, ChannelList* activeChannels) = 0;
+
+  /// Changes the interested I/O events.
+  /// Must be called in the loop thread.
+  virtual void updateChannel(Channel* channel) = 0;
+
+  /// Remove the channel, when it destructs.
+  /// Must be called in the loop thread.
+  virtual void removeChannel(Channel* channel) = 0;
+
+  static Poller* newDefaultPoller(EventLoop* loop);
+
+  void assertInLoopThread()
+  {
+    ownerLoop_->assertInLoopThread();
+  }
+
+ private:
+  EventLoop* ownerLoop_;	// Poller所属EventLoop
+};
+```
+
+**函数接口：**
+
+1. 静态成员函数`newDefaultPoller`，用于创建一个poller对象
+
+   ```c++
+   Poller* Poller::newDefaultPoller(EventLoop* loop)
+   {
+     if (::getenv("MUDUO_USE_POLL"))
+     {
+       return new PollPoller(loop);
+     }
+     else
+     {
+       return new EPollPoller(loop);
+     }
+   }
+   // 返回一个Poller指针，指向两个派生类对象，
+   // 并且根据环境变量的设置选择poll还是epoll底层
+   ```
+
+2. 其他成员函数
+
+   - channel的更新updateChannel（由eventloop调用）
+     - 负责事件描述符的关注、删除、更改
+     - 纯虚函数，因此需要在PollPoller或者EpollPoller中实现
+   - 移除channel关注removeChannel
+
+#### PollPoller分析
+
+```c++
+class PollPoller : public Poller
+{
+ public:
+
+  PollPoller(EventLoop* loop);
+  virtual ~PollPoller();
+
+  // 继承而来的接口，需要提供实现
+  virtual Timestamp poll(int timeoutMs, ChannelList* activeChannels);
+  virtual void updateChannel(Channel* channel);
+  virtual void removeChannel(Channel* channel);
+
+ private:
+  void fillActiveChannels(int numEvents,
+                          ChannelList* activeChannels) const;
+
+  typedef std::vector<struct pollfd> PollFdList; // 用向量来代表数组
+  typedef std::map<int, Channel*> ChannelMap;	// key是文件描述符，value是Channel*
+  PollFdList pollfds_;
+  ChannelMap channels_;
+};
+```
+
+**其他成员函数分析：**
+
+1. poll函数：用于Poller父类指针调用，进而产生多态。内部调用fillActiveChannels
+2. fillActiveChannels，用于当::poll函数返回的时候，将有事件响应的通道返回。
+
+**成员变量分析：**
+
+```c++
+typedef std::vector<struct pollfd> PollFdList; // 用向量来代表数组
+typedef std::map<int, Channel*> ChannelMap;	// key是文件描述符，value是Channel*
+
+struct pollfd {
+    int   fd;         /* file descriptor */
+    short events;     /* requested events */
+    short revents;    /* returned events */
+};
+// 在updatechannel的时候，更新对应fd(channel)的关注事件events
+pollfd.fd = channel->fd();
+pollfd.events = pfd.events = static_cast<short>(channel->events());
+```
+
+#### epollPoller分析
+
+**和PollPoller相比，多了个update函数，用于epollfd_的事件更改**
+
+#### **业务流程**
+
+1. eventloop拥有一个poller对象，然后在初始化构造的时候调用，**newDefaultPoller**
+
+   - 不负责生命期管理？
+   - **那么是谁来管理？**
+
+2. 根据环境变量`MUDUO_USE_POLL`判断生成何种Poller派生类对象
+
+   - PollPoller
+   - EpollPoller
+
+3. EventLoop通过`loop`开启事件循环
+
+   - 实际上是调用`成员变量poller_`的poll函数
+   - 产生动态绑定。根据poller_实际指向的派生类对象，调用不同的**poll**实现版本
+   - 并且在poll返回的时候，得到一个`activeChannels_`
+
+4. 对于已经返回的、有事件响应的`channel`。调用每个channel自身注册的`handleEvent`回调函数
+
+   - handleEvent又调用handleEventWithGuard
+
+     ```c++
+     // 最底层的业务处理函数。根据响应类型，调用对应的事件回调函数
+     void Channel::handleEventWithGuard(Timestamp receiveTime) // 业务处理函数
+     {
+       eventHandling_ = true;
+       if ((revents_ & POLLHUP) && !(revents_ & POLLIN))
+       {
+         if (logHup_)
+         {
+           LOG_WARN << "Channel::handle_event() POLLHUP";
+         }
+         if (closeCallback_) closeCallback_();
+       }
+     
+       if (revents_ & POLLNVAL) /* 文件未打开的事件 */
+       {
+         LOG_WARN << "Channel::handle_event() POLLNVAL";
+       }
+     
+       if (revents_ & (POLLERR | POLLNVAL))
+       {
+         if (errorCallback_) errorCallback_();
+       }
+       if (revents_ & (POLLIN | POLLPRI | POLLRDHUP))
+       {
+         if (readCallback_) readCallback_(receiveTime);
+       }
+       if (revents_ & POLLOUT)
+       {
+         if (writeCallback_) writeCallback_();
+       }
+       eventHandling_ = false;
+     }
+     ```
+
+**问题：何时注册channel的回调函数，**
+
+```c++
+// 返回当前关注的事件
+int events() const { return events_; }
+// used by pollers，用于poll返回activeChannels
+void set_revents(int revt) { revents_ = revt; } 
+// int revents() const { return revents_; }
+
+// 修改channel的关注事件
+bool isNoneEvent() const { return events_ == kNoneEvent; }
+// 开启可读事件关注
+void enableReading() { events_ |= kReadEvent; update(); }
+// void disableReading() { events_ &= ~kReadEvent; update(); }
+void enableWriting() { events_ |= kWriteEvent; update(); }
+void disableWriting() { events_ &= ~kWriteEvent; update(); }
+void disableAll() { events_ = kNoneEvent; update(); }
+bool isWriting() const { return events_ & kWriteEvent; }
+```
+
+**示例代码：**
+
+```c++
+#include <muduo/net/Channel.h>
+#include <muduo/net/EventLoop.h>
+
+#include <boost/bind.hpp>
+
+#include <stdio.h>
+#include <sys/timerfd.h>
+
+using namespace muduo;
+using namespace muduo::net;
+
+EventLoop* g_loop;
+int timerfd;
+
+void timeout(Timestamp receiveTime)
+{
+	printf("Timeout!\n");
+	uint64_t howmany;
+	::read(timerfd, &howmany, sizeof howmany);
+	g_loop->quit();
+}
+
+int main(void)
+{
+	EventLoop loop;
+	g_loop = &loop;
+
+	timerfd = ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+	Channel channel(&loop, timerfd);
+	channel.setReadCallback(boost::bind(timeout, _1));
+	channel.enableReading(); // 
+
+	struct itimerspec howlong;
+	bzero(&howlong, sizeof howlong); // 类似于memset
+	howlong.it_value.tv_sec = 1;
+	::timerfd_settime(timerfd, 0, &howlong, NULL);
+
+	loop.loop();
+
+	::close(timerfd);
+}
+```
+
+**epoll的数据结构**
+
+```c++
+typedef union epoll_data {
+    void    *ptr;
+    int      fd;
+    uint32_t u32;
+    uint64_t u64;
+} epoll_data_t;
+
+struct epoll_event {
+    uint32_t     events;    /* Epoll events */
+    epoll_data_t data;      /* User data variable */
+};
+  
+    int fd = channel->fd();
+    ChannelMap::const_iterator it = channels_.find(fd);
+    assert(it != channels_.end());
+    assert(it->second == channel);
+#endif
+    channel->set_revents(events_[i].events);
+    activeChannels->push_back(channel);
+  }
+}
+```
+
+### 四：muduo定时器实现
+
+![image-20210820163736891](大并发服务器开发Notes.assets/image-20210820163736891.png)
+
+#### timer类
+
+**成员变量：**
+
+```c
+const TimerCallback callback_;		// 定时器回调函数
+Timestamp expiration_;				// 下一次的超时时刻
+const double interval_;				// 超时时间间隔，如果是一次性定时器，该值为0
+const bool repeat_;					// 是否重复
+const int64_t sequence_;				// 定时器序号
+
+static AtomicInt64 s_numCreated_;		// 定时器计数，当前已经创建的定时器数量
+// 原子性操作
+```
+
+**对定时操作的一个高层次的抽象**
+
+#### timerqueue
+
+用于维护创建的timer对象，内部维护了一个定时器列表
+
+**数据结构选择：**
+
+- 目的：能够根据当前时间找到已经到期的时间（按时间排序）
+- 能够高效的删除和添加Timer
+- 二叉搜索树、map（不适用于key相同，但value不相等的情形）或者set
+
+```c++
+TimerId TimerQueue::addTimer(const TimerCallback& cb,
+                             Timestamp when,
+                             double interval)
+{
+  Timer* timer = new Timer(cb, when, interval);
+  /*
+  loop_->runInLoop(
+      boost::bind(&TimerQueue::addTimerInLoop, this, timer));
+	  */
+  addTimerInLoop(timer); // 这时候的addTimer无法实现跨线程调用
+  						// 因为addTimerInLoop会断言失败
+  return TimerId(timer, timer->sequence());
+}
+
+void TimerQueue::cancel(TimerId timerId)
+{
+  /*
+  loop_->runInLoop(
+      boost::bind(&TimerQueue::cancelInLoop, this, timerId));
+	  */
+  cancelInLoop(timerId);
+}
+```
+
+**实际上使用也不直接调用。而是通过EventLoop的**
+
+1. runAt
+2. runAfter
+3. runEvery
+4. cancel
+
+**timerqueue的功能**
+
+1. 支持跨线程调用的
+
+   - addTimer
+   - cancel
+
+2. 不支持跨线程调用的（不需要对临界资源加锁）
+
+   - addTimerInLoop
+   - cancelInLoop
+
+3. handleRead()函数
+
+   > timer内部有一个timerfd_;用于当计时器事件到来的时候，相关的channel有响应。并且调用`handleRead`函数来处理
+
+4. getExpired：返回超时的定时器列表
+
+5. reset：对超时的定时器重置（**重复的定时器**）
+
+![image-20210821100938575](大并发服务器开发Notes.assets/image-20210821100938575.png)
+
+### 五：一个线程如何通知另一个线程
+
+![image-20210822093154399](大并发服务器开发Notes.assets/image-20210822093154399.png)
+
+**条件变量不能用IO复用监听，muduo的条件唤醒用`eventfd`**
+
+#### 一个线程唤醒另一个线程`wakeup`
+
+**什么时候需要唤醒：**
+
+1. 添加一些用户任务的时候，可能需要唤醒
+2. 事件循环退出的时候
+
+#### 在I/O线程中执行某个回调函数`runInLoop`
+
+![image-20210822095251625](大并发服务器开发Notes.assets/image-20210822095251625.png)
+
+![image-20210822095410946](大并发服务器开发Notes.assets/image-20210822095410946.png)
+
+![image-20210822095545649](大并发服务器开发Notes.assets/image-20210822095545649.png)
+
+![image-20210822095933696](大并发服务器开发Notes.assets/image-20210822095933696.png)
+
+![image-20210822100302913](大并发服务器开发Notes.assets/image-20210822100302913.png)
+
+### 六：EventLoopThread（IO线程类）封装
+
+![image-20210822111623721](大并发服务器开发Notes.assets/image-20210822111623721.png)
+
+**为什么要使用mutex和条件变量**
+
+> 因为在startLoop返回当前IO线程的EventLoop对象指针的时候，线程入口函数可能还没有执行结束。
+
+**执行流程：**
+
+1. 构造函数初始化
+
+   - 初始化线程，并且将线程入口函数绑定为`EventLoopThread::threadFunc`
+
+   - 此时，该IO线程的`loop_ = NULL`
+
+   - 初始化其他变量（条件变量、互斥锁）
+
+   - 接受一个`ThreadInitCallback`，用于在loop循环开启前执行
+
+     ````c++
+     void EventLoopThread::threadFunc()
+     {
+       EventLoop loop;
+     
+       if (callback_)
+       {
+         callback_(&loop);
+       }
+     
+       {
+         MutexLockGuard lock(mutex_);
+         // loop_指针指向了一个栈上的对象，threadFunc函数退出之后，这个指针就失效了
+         // threadFunc函数退出，就意味着线程退出了，EventLoopThread对象也就没有存在的价值了。
+         // 因而不会有什么大的问题
+         loop_ = &loop;
+         cond_.notify();
+       }
+     
+       loop.loop();
+       //assert(exiting_);
+     }
+
+2. 对外暴露的接口为：`startLoop`
+
+   ```c++
+   EventLoop* EventLoopThread::startLoop()
+   {
+     assert(!thread_.started());
+     thread_.start(); // 会执行
+   
+     {
+       MutexLockGuard lock(mutex_);
+       while (loop_ == NULL)
+       {
+         cond_.wait();
+       }
+     }
+   
+     return loop_;
+   }
+   ```
+
+### 七：socket封装
+
+**需要进行如下几个类的封装**
+
+- 字节序转换函数
+- socket相关系统调用的封装
+- socket文件描述符的RAII方法
+- 网际地址sockaddr_in封装
+
+![image-20210822195343553](大并发服务器开发Notes.assets/image-20210822195343553.png)
+
+
+
+### 小结
+
+1. 事件循环EventLoop的关闭`loop_.quit()`
+
+   ```c++
+   void EventLoop::quit() // 可以跨线程调用
+   {
+     quit_ = true; // 多个线程的访问，不需要加锁。因为bool quit_在linux下是原子性操作
+     if (!isInLoopThread())
+     {
+       //wakeup();
+     }
+   }
+   
+   // 当跨线程调用的时候，由于loop所属对象可能还处于阻塞、事件处理状态。需要wakeup
+   // 1. 涉及间进程间通信
+   // 2. PIPE
+   // 3. eventfd
+   #include <sys/eventfd.h>
+   
+   int eventfd(unsigned int initval, int flags);
+   ```
+
+2. eventloop提供的runInLoop能够实现：线程安全的异步调用
+
+3. 地址转换函数
+
+   - 基于POSIX标准的
+     - htonl：32位地址转换
+     - htons：16位地址转换
+   - `endian.h`,只能在linux平台下使用
+
+   ![image-20210822195612033](大并发服务器开发Notes.assets/image-20210822195612033.png)
+
+4. 网络字节序：大端字节序
+
+5. linux网络编程的地址
+
+   ```c
+   struct sockaddr_in
+    
+   {
+    
+   short sin_family;/*Address family一般来说AF_INET（地址族）PF_INET（协议族）*/
+   
+   unsigned short sin_port;/*Port number(必须要采用网络数据格式,普通数字可以用htons()函数转换成网络数据格式的数字)*/
+    
+   struct in_addr sin_addr;/*IP address in network byte order（Internet address）*/
+    
+   unsigned char sin_zero[8];/*Same size as struct sockaddr没有实际意义,只是为了　跟SOCKADDR结构在内存中对齐*/
+    
+   };
+   
+   // sin_family指代协议族，在socket编程中只能是AF_INET
+   // sin_port存储端口号（使用网络字节顺序），在linux下，端口号的范围0~65535,同时0~1024范围的端口号已经被系统使用或保留
+
+### Acceptor类的封装
+
+![image-20210822202248516](大并发服务器开发Notes.assets/image-20210822202248516.png)
+
+**业务处理流程：**
+
+1. acceptor是一个监听套接字，绑定为一个channel
+
+2. 并且通过所在线程的EventLoop的poller监听，当有事件响应的时候。
+
+3. 会回调绑定注册到channel的`Acceptor::handleRead()`
+
+   - 会通过accept建立新的连接
+
+   - 并回调用户的callback（**这是什么意思**？）
+
+     > 也就是，当我们建立了一个新的连接，服务器端会做何种事情
+     >
+     > 如下的`newConnection`函数
+
+![image-20210822202631354](大并发服务器开发Notes.assets/image-20210822202631354.png)
+
+**执行过程：**
+
+1. 先确定服务器需要绑定的地址`listenAddr`
+2. 然后在主线程中创建一个eventloop对象
+3. 将acceptor绑定到loop中
+   - 设置acceptor的连接到来事件响应函数（用户提供）
+   - 开启监听`acceptor.listen`
+4. 开启loop循环监听
+
+### 九：TcpServer和TcpConnection
+
+![image-20210823155017070](大并发服务器开发Notes.assets/image-20210823155017070.png)
+
+1. TcpConnetion：是对连接的抽象。包含两个数据成员
+   - Socket和channel
+
+![image-20210823155125139](大并发服务器开发Notes.assets/image-20210823155125139.png)
+
+
+
+#### TcpServer类
+
+**类成员变量：**
+
+**成员函数**：
+
+```c++
+// 1. 构造函数
+// 用于初始化loop_, 主机名hostport
+ TcpServer(EventLoop* loop,
+            const InetAddress& listenAddr,
+            const string& nameArg);
+  ~TcpServer();  // force out-line dtor, for scoped_ptr members.
+```
+
+
+
+#### TcpConnection类
+
+**特征：**继承自`boost::enable_shared_from_this<TcpConnection>`
+
+> 不能直接`TcpConnectionPtr guardThis(this);`，这样是两个shared_ptr指向同一块内存。分别计算引用
+
+**生存期管理：**
+
+> 我们不能直接在TcpServer中删除`TcpConnection`对象，因为此时我们正处于TcpConnection的channel的事件处理`handleRead`中。会出现`core dump`
+>
+> **因此，应该将tcpconnecttion的生存期，藏于handleEvent中**
+
+![image-20210823161832989](大并发服务器开发Notes.assets/image-20210823161832989.png)
+
+**通过shared_ptr管理TcpConnection对象。**
+
+1. 当连接到来，创建一个`TcpConnection对象`，立刻用`shared_ptr`管理。引用计数为1
+2. 在channel中维护一个`weak_ptr(tie_)`，将这个shared_ptr对象赋值给tie_,引用计数仍然为1
+3. 当连接关闭，调用了channel的handleEvent函数，在handleEvent中。将tie_提升。此时shared_ptr引用计数为2。
+4. 在TcpServer中erase，引用计数减为1
+
+![image-20210823162143733](大并发服务器开发Notes.assets/image-20210823162143733.png)
+
+```c
+20210823 13:10:32.426518Z 24681 TRACE newConnection [1] usecount=1-TcpServer.cc:87
+20210823 13:10:32.426531Z 24681 TRACE newConnection [2] usecount=2-TcpServer.cc:89
+20210823 13:10:32.426535Z 24681 TRACE connectEstablished [3] usecount=3-TcpConnection.cc:61
+20210823 13:10:32.426541Z 24681 TRACE updateChannel fd = 8 events = 3-EPollPoller.cc:97
+onConnection(): new connection [TestServer:0.0.0.0:8888#1] from 127.0.0.1:58628
+20210823 13:10:32.426555Z 24681 TRACE connectEstablished [4] usecount=3-TcpConnection.cc:68
+20210823 13:10:32.426558Z 24681 TRACE newConnection [5] usecount=2-TcpServer.cc:97
+20210823 13:10:41.098531Z 24681 TRACE poll 1 events happened-EPollPoller.cc:56
+20210823 13:10:41.098551Z 24681 TRACE printActiveChannels {8: IN } -EventLoop.cc:258
+onMessage(): received 14 bytes from connection [TestServer:0.0.0.0:8888#1]
+20210823 13:10:51.103162Z 24681 TRACE poll  nothing happened-EPollPoller.cc:65
+20210823 13:10:53.135067Z 24681 TRACE poll 1 events happened-EPollPoller.cc:56
+20210823 13:10:53.135088Z 24681 TRACE printActiveChannels {8: IN } -EventLoop.cc:258
+20210823 13:10:53.135121Z 24681 TRACE handleClose fd = 8 state = 2-TcpConnection.cc:133
+20210823 13:10:53.135126Z 24681 TRACE updateChannel fd = 8 events = 0-EPollPoller.cc:97
+onConnection(): connection [TestServer:0.0.0.0:8888#1] is down
+20210823 13:10:53.135151Z 24681 TRACE handleClose [7] usecount=3-TcpConnection.cc:141
+20210823 13:10:53.135158Z 24681 INFOW TcpServer::removeConnectionInLoop [TestServer] - connection TestServer:0.0.0.0:8888#1-TcpServer.cc:105
+20210823 13:10:53.135162Z 24681 TRACE removeConnection [8] usecount=3-TcpServer.cc:108
+20210823 13:10:53.135173Z 24681 TRACE removeConnection [9] usecount=2-TcpServer.cc:111
+20210823 13:10:53.135183Z 24681 TRACE removeConnection [10] usecount=3-TcpServer.cc:119
+20210823 13:10:53.135186Z 24681 TRACE handleClose [8] usecount=3-TcpConnection.cc:144
+20210823 13:10:53.135191Z 24681 TRACE removeChannel  fd = 8-EPollPoller.cc:142
+20210823 13:10:53.135200Z 24681 DEBUG ~TcpConnection TcpConnection::dtor[TestServer:0.0.0.0:8888#1] at 0x11AA780 fd=8-TcpConnection.cc:51
+```
+
+### 十一：muduo库如何支持多线程（one loop perthread)
+
+**通过实现一个`EventLoopThreadPool`类（IO线程池）**
+
+![image-20210824093003821](大并发服务器开发Notes.assets/image-20210824093003821.png)
+
+根据`setThreadNum`设置线程池线程个数，选择时单线程还是多线程reactors
+
+**代码测试`reactor_test10`与结果分析**
+
+###   十二：应用层缓冲区Buffer设计
+
+**为什么要有Buffer缓冲？**
+
+- 高流量的write，不能阻塞
+- tcp协议存在的，粘包、丢包问题。
+
+1. **首先我们的每一个TcpConnection都是设置为非阻塞模式**
+
+   - 在TcpServer中，给`acceptor`通过setNewConnectionCallback注册了一个`TcpServer::newConnection`
+
+   ```c++
+   void TcpServer::newConnection(int sockfd, const InetAddress& peerAddr)
+   {
+     loop_->assertInLoopThread();
+     // 按照轮叫的方式选择一个EventLoop
+     EventLoop* ioLoop = threadPool_->getNextLoop();
+     char buf[32];
+     snprintf(buf, sizeof buf, ":%s#%d", hostport_.c_str(), nextConnId_);
+     ++nextConnId_;
+     string connName = name_ + buf;
+   
+     InetAddress localAddr(sockets::getLocalAddr(sockfd));
+   
+     TcpConnectionPtr conn(new TcpConnection(ioLoop,
+                                             connName,
+                                             sockfd,
+                                             localAddr,
+                                             peerAddr));
+     connections_[connName] = conn;
+     conn->setConnectionCallback(connectionCallback_);
+     conn->setMessageCallback(messageCallback_);
+   
+     conn->setCloseCallback(
+         boost::bind(&TcpServer::removeConnection, this, _1));
+     ioLoop->runInLoop(boost::bind(&TcpConnection::connectEstablished, conn));
+   }
+   
+   // 而在Acceptor中，当有新的连接到来的时候，会handleRead()
+   void Acceptor::handleRead()
+   {
+     loop_->assertInLoopThread();
+     InetAddress peerAddr(0);
+     //FIXME loop until no more
+     int connfd = acceptSocket_.accept(&peerAddr);
+     if (connfd >= 0)
+     {
+       // string hostport = peerAddr.toIpPort();
+       // LOG_TRACE << "Accepts of " << hostport;
+       if (newConnectionCallback_)
+       {
+         newConnectionCallback_(connfd, peerAddr);
+       }
+       else
+       {
+         sockets::close(connfd);
+       }
+     }
+   }
+   
+   // 如果注册了newConnectionCallback就会调用TcpServer的onNewConnection函数
+   // 其中，connfd
+   int Socket::accept(InetAddress* peeraddr)
+   {
+     struct sockaddr_in addr;
+     bzero(&addr, sizeof addr);
+     int connfd = sockets::accept(sockfd_, &addr);
+     if (connfd >= 0)
+     {
+       peeraddr->setSockAddrInet(addr);
+     }
+     return connfd;
+   }
+   
+   #if VALGRIND
+     int connfd = ::accept(sockfd, sockaddr_cast(addr), &addrlen);
+     setNonBlockAndCloseOnExec(connfd);
+   #else
+     int connfd = ::accept4(sockfd, sockaddr_cast(addr),
+                            &addrlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
+   #endif
+   // 设置为非阻塞模式
+   ```
+
+2. TcpConnection必须要有输出缓冲区
+
+   ![image-20210824160541431](大并发服务器开发Notes.assets/image-20210824160541431.png)
+
+3. 要让程序在write操作上不阻塞，网络库必须要给每个tcpconnection配置output buffer
+
+   ![image-20210824161352359](大并发服务器开发Notes.assets/image-20210824161352359.png)
+
+   ![image-20210824161755512](大并发服务器开发Notes.assets/image-20210824161755512.png)
+
+#### readFd实现
+
+**需要考虑的问题：**如果分配了5k个连接，每个链接都分配64K的缓冲区（input和output）。将占用640M内存
+
+```c++
+// 结合栈上的空间，避免内存使用过大，提高内存使用率
+// 如果有5K个连接，每个连接就分配64K+64K的缓冲区的话，将占用640M内存，
+// 而大多数时候，这些缓冲区的使用率很低
+ssize_t Buffer::readFd(int fd, int* savedErrno)
+{
+  // saved an ioctl()/FIONREAD call to tell how much to read
+  // 节省一次ioctl系统调用（获取有多少可读数据）
+  char extrabuf[65536];
+  struct iovec vec[2];
+  const size_t writable = writableBytes();
+  // 第一块缓冲区
+  vec[0].iov_base = begin()+writerIndex_;
+  vec[0].iov_len = writable;
+  // 第二块缓冲区
+  vec[1].iov_base = extrabuf;
+  vec[1].iov_len = sizeof extrabuf;
+  const ssize_t n = sockets::readv(fd, vec, 2);
+  if (n < 0)
+  {
+    *savedErrno = errno;
+  }
+  else if (implicit_cast<size_t>(n) <= writable)	//第一块缓冲区足够容纳
+  {
+    writerIndex_ += n;
+  }
+  else		// 当前缓冲区，不够容纳，因而数据被接收到了第二块缓冲区extrabuf，将其append至buffer
+  {
+    writerIndex_ = buffer_.size();
+    append(extrabuf, n - writable);
+  }
+  // if (n == writable + sizeof extrabuf)
+  // {
+  //   goto line_30;
+  // }
+  return n;
+}
+```
+
+### 十三：TcpConnection补充（增加send，shutdown处理）
+
+#### 其他缓冲区设计要求
+
+**零拷贝：**数据从内核到用户空间，总是有一次拷贝的。
+
+> 要想实现真正的零拷贝，除非将程序实现到内核中
+
+![image-20210824165939954](大并发服务器开发Notes.assets/image-20210824165939954.png)
+
+> 存在的问题：应用层的业务逻辑更为复杂
+
+#### shutdown
+
+应用程序想关闭连接，但是有可能处于发送数据的过程中，output buffer中数据还没发送完。**不能直接调用close**
+
+```c++
+void TcpConnection::shutdown()
+{
+  // FIXME: use compare and swap
+  if (state_ == kConnected) // 判断是否是处于连接的状态
+  {
+    setState(kDisconnecting);
+    // FIXME: shared_from_this()?
+    loop_->runInLoop(boost::bind(&TcpConnection::shutdownInLoop, this));
+  }
+}
+
+void TcpConnection::shutdownInLoop()
+{
+  loop_->assertInLoopThread();
+  if (!channel_->isWriting()) // 如果没有关注POLLOUT
+  {
+    // we are not writing
+    socket_->shutdownWrite(); // 则关闭写端
+  }
+}
+// 如果数据还没有发送完毕，即还在关注POLLOUT事件，那么就只是将状态设置为kDisconnecting
+// 并没有去关闭连接
+
+bool isWriting() const { return events_ & kWriteEvent; }
+const int Channel::kWriteEvent = POLLOUT;
+
+void Socket::shutdownWrite()
+{
+  sockets::shutdownWrite(sockfd_);
+}
+
+void sockets::shutdownWrite(int sockfd)
+{
+  if (::shutdown(sockfd, SHUT_WR) < 0)
+  {
+    LOG_SYSERR << "sockets::shutdownWrite";
+  }
+}
+```
+
+**当数据发送完毕，取消关注POLLOUT事件，那么对于处于kDisconneting状态的TcpConnection，需要主动关闭write，客户端read返回为0，这时候客户端会`close(conn)`**
+
+这时候，服务器端会收到`POLLHUP | POLLIN`
+
+#### writeCompleteCallback
+
+当所有数据都发送到内核缓冲区的时候，会调用该回调函数。
+
+通常情况下，在大流量的应用场景需要关注该事件。
+
+**大流量服务：**
+
+> 不断生成数据，然后`conn->send()`，如果对等方接收不及时，受到通告窗口的控制，内核发送缓冲不足。
+>
+> 这时候就会将用户数据添加到应用层缓冲区（output buffer）；可能会撑爆output buffer
+>
+> **解决办法：**通过关注`WriteCompleteCallback`函数调整发送频率，当应用层接收到，所有数据都发送完，WriteCompleteCallback回调，再发送其他数据。
+
+**也被称为低水位标回调函数**：output buffer被清空的时候，会回调该函数。
+
+#### 高水位标回调函数highWaterMarkCallback
+
+1. 当对等方接受不及时的时候，而我们又没有关注`writeCompleteCallback`，会导致output buffer不断增大。
+2. 当高水位标到达的时候，就断开连接
+
+**通过注册回调函数的形式实现**
+
+#### boost::any_context
+
+**TcpConnection的属性：`boost::any_context`**，用于绑定一个未知类型的上下文对象
+
+用于上层应用程序绑定一个，每个链接都有的上下文对象
+
+![image-20210824213549459](大并发服务器开发Notes.assets/image-20210824213549459.png)
+
 
 
 # 总结
@@ -1630,6 +2539,26 @@ int main(void)
 如果服务器端再次调用write，这时候就会产生SIGPIPE信号。
 
 **对高可用不友好**
+
+**muduo库在`EventLoop`中实现**
+
+```c++
+#pragma GCC diagnostic ignored "-Wold-style-cast"
+class IgnoreSigPipe
+{
+ public:
+  IgnoreSigPipe()
+  {
+    ::signal(SIGPIPE, SIG_IGN);
+    LOG_TRACE << "Ignore SIGPIPE";
+  }
+};
+#pragma GCC diagnostic error "-Wold-style-cast"
+
+IgnoreSigPipe initObj;
+```
+
+
 
 ### SIGCHLD信号
 
@@ -1754,7 +2683,7 @@ void Channel::handleEventWithGuard(Timestamp receiveTime) // 事件处理函数
 }
 ```
 
-
+**如果是服务器端主动关闭连接，导致客户端read为0，调用close(fd)，那么服务器端会受到`POLLIN | POLLHUP`**
 
 ## 套接字超时设置
 
@@ -2087,6 +3016,23 @@ int main(void)
 
 ![image-20210813101022399](大并发服务器开发Notes.assets/image-20210813101022399.png)
 
+### eventloop支持的功能
+
+1. 支持定时事件runAt，runAfter，runEvery
+
+   - 通过timerqueue实现，管理多个定时器。并且在第一个计时器到期的时候，会处理相应的定时器事件
+   - 内部有一个
+
+2. 支持跨线程添加事件runInLoop
+
+   > 线程唤醒、通知通过`eventfd`实现。虽然有pipe，socketpair，条件变量，但是eventfd更优。
+   >
+   > 因为，只有一个文件描述符
+   >
+   > **用于执行一些计算任务**
+
+3. 以上两种事件添加方式都是支持跨线程调用的。（线程安全的，避免锁竞争）
+
 ## muduo库介绍
 
 1. 两个静态库：base和net
@@ -2097,6 +3043,10 @@ int main(void)
 ### 编译选项
 
 ![image-20210813205640679](大并发服务器开发Notes.assets/image-20210813205640679.png)
+
+### 为什么选择epoll的LT模式，而不是ET模式
+
+
 
 ## RPC通信协议
 
@@ -2116,6 +3066,22 @@ C语言里面，通过时间纪元计算自`1970-01-01 00:00:00`的时间(用一
 https://blog.csdn.net/bzhxuexi/article/details/17021559
 
 1. dynamic_cast的作用及缺点
+
+
+### 参数传递
+
+1. 并不是所有的类对象都应该用引用传递。
+
+   ```c++
+   inline Timestamp addTime(Timestamp timestamp, double seconds)
+   {
+     int64_t delta = static_cast<int64_t>(seconds * Timestamp::kMicroSecondsPerSecond);
+     return Timestamp(timestamp.microSecondsSinceEpoch() + delta);
+   }
+   
+   // Timestamp是一个64位整数，在值传递的时候，会将timestamp传递到8字节的寄存器当中。
+   // 而不是传递到堆栈中，这样更优
+   ```
 
    
 
@@ -2186,6 +3152,16 @@ int pthread_setspecific(pthread_key_t key, const void *value);
      > 多线程fork之后会出现死锁
 
    - **见muduo/base/Thread.cc的设计实现**
+   
+4. 一个系统默认打开的文件描述符，
+
+   - 0：标准输入
+   - 1：标准输出
+   - 2：标准错误
+
+5. 应用编程：直接使用C、C++以及网络库代码，不使用系统调用
+
+6. 系统编程：涉及到系统调用
 
 ## 收获
 
@@ -2196,8 +3172,6 @@ int pthread_setspecific(pthread_key_t key, const void *value);
 #### boost的单元测试框架
 
 需要安装`libboost-test-dev`
-
-
 
 ### exception的设计思想
 

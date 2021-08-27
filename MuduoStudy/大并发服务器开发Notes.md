@@ -2526,7 +2526,82 @@ void sockets::shutdownWrite(int sockfd)
 
 ![image-20210824213549459](大并发服务器开发Notes.assets/image-20210824213549459.png)
 
+### 十五：对于TCP客户端程序的支持
 
+![image-20210827095016274](大并发服务器开发Notes.assets/image-20210827095016274.png)
+
+**需要结合connect的select关注实现？**
+
+1. 从键盘接收输入：前台线程
+2. 从网络接受数据：IO线程
+
+**connector的作用：**
+
+1. 和acceptor相似，用于给TcpClient提供服务。是TcpClient的数据成员。
+
+2. 在TcpClient构造函数中初始化，与TcpClient对象共享一个eventloop。
+
+3. 并且注册连接成功回调函数为`TcpClient::newConnection`，用于connector成功连接后调用。（类似于acceptor的注册）
+
+   1. TcpClient调用`Tcp::Connect`，让connector_开始`start`，发起连接
+
+   2. 当start一些列调用完成之后，会回调注册的`Tcp::newConnection`函数，并且生成返回一个TcpConnection对象。
+
+      - startInLoop添加到runInLoop执行
+
+      - 如果`connect_`为true，那么调用`Connector::connect`函数，创建套接字文件描述符`sockets::createNonBlockingOrDie()`
+
+      - 然后尝试`sockets::connect连接`
+
+        - 如果连接成功，则`connector::connecting`
+
+          > 当前处于connecting的状态，那么就创建一个channel_，通过关注`handleWrite`事件来，让poller自动返回调用，生成tcpConnection对象
+          >
+          > **参考Linux网络编程的select超时实现**
+
+        - 否则根据返回值类型，判断是否需要重连
+
+      - 在handleWrite的时候，不再需要关注是否可以建立连接的事件。调用`removeAndResetChannel`，从poller中取消关注，将connector的channel置空。
+
+        > 此时，返回成功并不代表连接建立成功。还需要`sockets::getSocketError`判断错误类型。
+        >
+        > 如果成功建立连接`setState(kConnected)`，并且根据是否注册newConnectionCallback_执行回调
+
+   3. 对TcpConnection的业务逻辑，进行相应的回调函数注册
+
+      ```c++
+      void TcpClient::newConnection(int sockfd)
+      {
+        loop_->assertInLoopThread();
+        InetAddress peerAddr(sockets::getPeerAddr(sockfd));
+        char buf[32];
+        snprintf(buf, sizeof buf, ":%s#%d", peerAddr.toIpPort().c_str(), nextConnId_);
+        ++nextConnId_;
+        string connName = name_ + buf;
+      
+        InetAddress localAddr(sockets::getLocalAddr(sockfd));
+        // FIXME poll with zero timeout to double confirm the new connection
+        // FIXME use make_shared if necessary
+        TcpConnectionPtr conn(new TcpConnection(loop_,
+                                                connName,
+                                                sockfd,
+                                                localAddr,
+                                                peerAddr));
+      // TcpConnection业务逻辑的回调函数注册
+        conn->setConnectionCallback(connectionCallback_);
+        conn->setMessageCallback(messageCallback_);
+        conn->setWriteCompleteCallback(writeCompleteCallback_);
+        conn->setCloseCallback(
+            boost::bind(&TcpClient::removeConnection, this, _1)); // FIXME: unsafe
+        {
+          MutexLockGuard lock(mutex_);
+          connection_ = conn;		// 保存TcpConnection
+        }
+        conn->connectEstablished();		// 这里回调connectionCallback_
+      }
+      ```
+
+      
 
 # 总结
 
@@ -2557,8 +2632,6 @@ class IgnoreSigPipe
 
 IgnoreSigPipe initObj;
 ```
-
-
 
 ### SIGCHLD信号
 

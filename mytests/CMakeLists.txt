@@ -55,6 +55,13 @@ target_link_libraries(reactor_test12 tmuduo_net)
 add_executable(reactor_test13 Reactor_test13.cc)
 target_link_libraries(reactor_test13 tmuduo_net)
 
+# TcpClient_test
+add_executable(TcpClient_test TcpClient_test.cc)
+target_link_libraries(TcpClient_test tmuduo_net)
+
+# 构建TcpServer
+add_executable(TcpServer_test TcpServer_test.cc)
+target_link_libraries(TcpServer_test tmuduo_net)
 ## 测试TcpServer的业务逻辑
 ### 不封装TestServer
 #add_executable(reactor_test08 Reactor_test08.cc)

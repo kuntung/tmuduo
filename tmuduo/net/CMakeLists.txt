@@ -2,6 +2,7 @@ set(net_SRCS
 Acceptor.cc
 Buffer.cc
 Channel.cc
+Connector.cc
 EventLoop.cc
 EventLoopThread.cc
 EventLoopThreadPool.cc
@@ -13,6 +14,7 @@ SocketsOps.cc
 Socket.cc
 InetAddress.cc
 TcpConnection.cc
+TcpClient.cc
 TcpServer.cc
 Timer.cc
 TimerQueue.cc

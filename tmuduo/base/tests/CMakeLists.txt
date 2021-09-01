@@ -1,3 +1,6 @@
+# 异步日志测试
+add_executable(AsyncLogging_test AsyncLogging_test.cc)
+target_link_libraries(AsyncLogging_test tmuduo_base)
 # 日志测试
 add_executable(Logging_test2 Logging_test.cc)
 target_link_libraries(Logging_test2 tmuduo_base)

@@ -1,9 +1,9 @@
 #include "codec.h"
 
-#include <muduo/base/Logging.h>
-#include <muduo/base/Mutex.h>
-#include <muduo/net/EventLoopThread.h>
-#include <muduo/net/TcpClient.h>
+#include <tmuduo/base/Logging.h>
+#include <tmuduo/base/Mutex.h>
+#include <tmuduo/net/EventLoopThread.h>
+#include <tmuduo/net/TcpClient.h>
 
 #include <boost/bind.hpp>
 #include <boost/noncopyable.hpp>
@@ -11,8 +11,8 @@
 #include <iostream>
 #include <stdio.h>
 
-using namespace muduo;
-using namespace muduo::net;
+using namespace tmuduo;
+using namespace tmuduo::net;
 
 class ChatClient : boost::noncopyable
 {

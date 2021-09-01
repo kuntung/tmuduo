@@ -42,6 +42,7 @@ namespace net
 class Buffer : public tmuduo::copyable
 {
  public:
+ // 设置初始长度以及预留头部长度
   static const size_t kCheapPrepend = 8;
   static const size_t kInitialSize = 1024;
 
@@ -57,32 +58,32 @@ class Buffer : public tmuduo::copyable
 
   // default copy-ctor, dtor and assignment are fine
 
-  void swap(Buffer& rhs)
+  void swap(Buffer& rhs) // buffer的交换
   {
     buffer_.swap(rhs.buffer_);
     std::swap(readerIndex_, rhs.readerIndex_);
     std::swap(writerIndex_, rhs.writerIndex_);
   }
 
-  size_t readableBytes() const
+  size_t readableBytes() const // buffer缓冲区的数据有效长度
   { return writerIndex_ - readerIndex_; }
 
-  size_t writableBytes() const
+  size_t writableBytes() const // 尾部buffer长度
   { return buffer_.size() - writerIndex_; }
 
-  size_t prependableBytes() const
+  size_t prependableBytes() const // 头部剩余长度
   { return readerIndex_; }
 
-  const char* peek() const
+  const char* peek() const // 得到有效数据的起始地址
   { return begin() + readerIndex_; }
 
-  const char* findCRLF() const
+  const char* findCRLF() const // 查找"\r\n"
   {
     const char* crlf = std::search(peek(), beginWrite(), kCRLF, kCRLF+2);
     return crlf == beginWrite() ? NULL : crlf;
   }
 
-  const char* findCRLF(const char* start) const
+  const char* findCRLF(const char* start) const // 从哪个位置开始查找"\r\n"
   {
     assert(peek() <= start);
     assert(start <= beginWrite());
@@ -134,7 +135,7 @@ class Buffer : public tmuduo::copyable
     writerIndex_ = kCheapPrepend;
   }
 
-  string retrieveAllAsString()
+  string retrieveAllAsString() // 获取数据，并且返回string
   {
     return retrieveAsString(readableBytes());;
   }
@@ -145,21 +146,21 @@ class Buffer : public tmuduo::copyable
     string result(peek(), len);
     retrieve(len);
     return result;
-  }
+  } // 获取指定长度的数据，并且以字符串返回
 
   StringPiece toStringPiece() const
   {
     return StringPiece(peek(), static_cast<int>(readableBytes()));
   }
 
-  void append(const StringPiece& str)
+  void append(const StringPiece& str) // 向当前缓冲区添加字符串
   {
     append(str.data(), str.size());
   }
 
-  void append(const char* /*restrict*/ data, size_t len)
+  void append(const char* /*restrict*/ data, size_t len) // 将data起始长度len的字符串添加到缓冲区
   {
-    ensureWritableBytes(len);
+    ensureWritableBytes(len); // 确保当前能够写入len长度的数据
     std::copy(data, data+len, beginWrite());
     hasWritten(len);
   }
@@ -293,7 +294,7 @@ class Buffer : public tmuduo::copyable
   {
     // FIXME: use vector::shrink_to_fit() in C++ 11 if possible.
     Buffer other;
-    other.ensureWritableBytes(readableBytes()+reserve);
+    other.ensureWritableBytes(readableBytes()+reserve); // 保留的数据长度为min(kInitialSize, 数据长度 + reserve)
     other.append(toStringPiece());
     swap(other);
   }
@@ -312,7 +313,7 @@ class Buffer : public tmuduo::copyable
   const char* begin() const
   { return &*buffer_.begin(); }
 
-  void makeSpace(size_t len)
+  void makeSpace(size_t len) // vector扩容
   {
     if (writableBytes() + prependableBytes() < len + kCheapPrepend)
     {
@@ -326,9 +327,9 @@ class Buffer : public tmuduo::copyable
       size_t readable = readableBytes();
       std::copy(begin()+readerIndex_,
                 begin()+writerIndex_,
-                begin()+kCheapPrepend);
+                begin()+kCheapPrepend); // 进行数据腾挪
       readerIndex_ = kCheapPrepend;
-      writerIndex_ = readerIndex_ + readable;
+      writerIndex_ = readerIndex_ + readable; // 新的可写下标为readerIndex_ + readable(之前保留的数据)
       assert(readable == readableBytes());
     }
   }

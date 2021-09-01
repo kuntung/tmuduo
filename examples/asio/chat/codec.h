@@ -1,10 +1,10 @@
 #ifndef MUDUO_EXAMPLES_ASIO_CHAT_CODEC_H
 #define MUDUO_EXAMPLES_ASIO_CHAT_CODEC_H
 
-#include <muduo/base/Logging.h>
-#include <muduo/net/Buffer.h>
-#include <muduo/net/Endian.h>
-#include <muduo/net/TcpConnection.h>
+#include <tmuduo/base/Logging.h>
+#include <tmuduo/net/Buffer.h>
+#include <tmuduo/net/Endian.h>
+#include <tmuduo/net/TcpConnection.h>
 
 #include <boost/function.hpp>
 #include <boost/noncopyable.hpp>
@@ -12,18 +12,18 @@
 class LengthHeaderCodec : boost::noncopyable
 {
  public:
-  typedef boost::function<void (const muduo::net::TcpConnectionPtr&,
-                                const muduo::string& message,
-                                muduo::Timestamp)> StringMessageCallback;
+  typedef boost::function<void (const tmuduo::net::TcpConnectionPtr&,
+                                const tmuduo::string& message,
+                                tmuduo::Timestamp)> StringMessageCallback;
 
   explicit LengthHeaderCodec(const StringMessageCallback& cb)
     : messageCallback_(cb)
   {
   }
 
-  void onMessage(const muduo::net::TcpConnectionPtr& conn,
-                 muduo::net::Buffer* buf,
-                 muduo::Timestamp receiveTime)
+  void onMessage(const tmuduo::net::TcpConnectionPtr& conn,
+                 tmuduo::net::Buffer* buf,
+                 tmuduo::Timestamp receiveTime)
   {
     // 这里用while而不用if
     while (buf->readableBytes() >= kHeaderLen) // kHeaderLen == 4
@@ -31,7 +31,7 @@ class LengthHeaderCodec : boost::noncopyable
       // FIXME: use Buffer::peekInt32()
       const void* data = buf->peek();
       int32_t be32 = *static_cast<const int32_t*>(data); // SIGBUS
-      const int32_t len = muduo::net::sockets::networkToHost32(be32);
+      const int32_t len = tmuduo::net::sockets::networkToHost32(be32);
       if (len > 65536 || len < 0)
       {
         LOG_ERROR << "Invalid length " << len;
@@ -41,7 +41,7 @@ class LengthHeaderCodec : boost::noncopyable
       else if (buf->readableBytes() >= len + kHeaderLen)  // 达到一条完整的消息
       {
         buf->retrieve(kHeaderLen);
-        muduo::string message(buf->peek(), len);
+        tmuduo::string message(buf->peek(), len);
         messageCallback_(conn, message, receiveTime);
         buf->retrieve(len);
       }
@@ -53,13 +53,13 @@ class LengthHeaderCodec : boost::noncopyable
   }
 
   // FIXME: TcpConnectionPtr
-  void send(muduo::net::TcpConnection* conn,
-            const muduo::StringPiece& message)
+  void send(tmuduo::net::TcpConnection* conn,
+            const tmuduo::StringPiece& message)
   {
-    muduo::net::Buffer buf;
+    tmuduo::net::Buffer buf;
     buf.append(message.data(), message.size());
     int32_t len = static_cast<int32_t>(message.size());
-    int32_t be32 = muduo::net::sockets::hostToNetwork32(len);
+    int32_t be32 = tmuduo::net::sockets::hostToNetwork32(len);
     buf.prepend(&be32, sizeof be32);
     conn->send(&buf);
   }

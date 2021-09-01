@@ -62,6 +62,10 @@ target_link_libraries(TcpClient_test tmuduo_net)
 # 构建TcpServer
 add_executable(TcpServer_test TcpServer_test.cc)
 target_link_libraries(TcpServer_test tmuduo_net)
+
+# 文件传输客户端
+add_executable(Filetransfer_client Filetransfer_client.cc)
+target_link_libraries(Filetransfer_client tmuduo_net)
 ## 测试TcpServer的业务逻辑
 ### 不封装TestServer
 #add_executable(reactor_test08 Reactor_test08.cc)

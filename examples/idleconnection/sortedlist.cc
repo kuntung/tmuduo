@@ -1,12 +1,12 @@
-#include <muduo/base/Logging.h>
-#include <muduo/net/EventLoop.h>
-#include <muduo/net/TcpServer.h>
+#include <tmuduo/base/Logging.h>
+#include <tmuduo/net/EventLoop.h>
+#include <tmuduo/net/TcpServer.h>
 #include <boost/bind.hpp>
 #include <list>
 #include <stdio.h>
 
-using namespace muduo;
-using namespace muduo::net;
+using namespace tmuduo;
+using namespace tmuduo::net;
 
 // RFC 862
 class EchoServer
@@ -35,7 +35,7 @@ class EchoServer
   typedef boost::weak_ptr<TcpConnection> WeakTcpConnectionPtr;
   typedef std::list<WeakTcpConnectionPtr> WeakConnectionList;
 
-  struct Node : public muduo::copyable
+  struct Node : public tmuduo::copyable
   {
     Timestamp lastReceiveTime; // 该连接最后一次活跃时刻
     WeakConnectionList::iterator position; // 该连接在连接列表中的位置

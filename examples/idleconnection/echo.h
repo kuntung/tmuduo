@@ -1,7 +1,7 @@
 #ifndef MUDUO_EXAMPLES_IDLECONNECTION_ECHO_H
 #define MUDUO_EXAMPLES_IDLECONNECTION_ECHO_H
 
-#include <muduo/net/TcpServer.h>
+#include <tmuduo/net/TcpServer.h>
 //#include <muduo/base/Types.h>
 
 #include <boost/circular_buffer.hpp>
@@ -23,26 +23,26 @@ inline size_t hash_value(const boost::shared_ptr<T>& x)
 class EchoServer
 {
  public:
-  EchoServer(muduo::net::EventLoop* loop,
-             const muduo::net::InetAddress& listenAddr,
+  EchoServer(tmuduo::net::EventLoop* loop,
+             const tmuduo::net::InetAddress& listenAddr,
              int idleSeconds);
 
   void start();
 
  private:
-  void onConnection(const muduo::net::TcpConnectionPtr& conn);
+  void onConnection(const tmuduo::net::TcpConnectionPtr& conn);
 
-  void onMessage(const muduo::net::TcpConnectionPtr& conn,
-                 muduo::net::Buffer* buf,
-                 muduo::Timestamp time);
+  void onMessage(const tmuduo::net::TcpConnectionPtr& conn,
+                 tmuduo::net::Buffer* buf,
+                 tmuduo::Timestamp time);
 
   void onTimer();
 
   void dumpConnectionBuckets() const;
 
-  typedef boost::weak_ptr<muduo::net::TcpConnection> WeakTcpConnectionPtr;
+  typedef boost::weak_ptr<tmuduo::net::TcpConnection> WeakTcpConnectionPtr;
 
-  struct Entry : public muduo::copyable
+  struct Entry : public tmuduo::copyable
   {
     explicit Entry(const WeakTcpConnectionPtr& weakConn)
       : weakConn_(weakConn)
@@ -51,7 +51,7 @@ class EchoServer
 
     ~Entry()
     {
-      muduo::net::TcpConnectionPtr conn = weakConn_.lock();
+      tmuduo::net::TcpConnectionPtr conn = weakConn_.lock();
       if (conn)
       {
         conn->shutdown();
@@ -65,8 +65,8 @@ class EchoServer
   typedef boost::unordered_set<EntryPtr> Bucket;  // 环形缓冲区每个格子存放的是一个hash_set
   typedef boost::circular_buffer<Bucket> WeakConnectionList;  // 环形缓冲区
 
-  muduo::net::EventLoop* loop_;
-  muduo::net::TcpServer server_;
+  tmuduo::net::EventLoop* loop_;
+  tmuduo::net::TcpServer server_;
   WeakConnectionList connectionBuckets_; // 连接队列环形缓冲区
 };
 

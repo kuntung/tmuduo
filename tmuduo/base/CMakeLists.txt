@@ -1,4 +1,5 @@
 set(base_SRCS
+ AsyncLogging.cc
  Timestamp.cc
  Exception.cc
  Thread.cc

@@ -2601,7 +2601,221 @@ void sockets::shutdownWrite(int sockfd)
       }
       ```
 
-      
+## http库源码分析
+
+### http请求
+
+![image-20210828105600097](大并发服务器开发Notes.assets/image-20210828105600097.png)
+
+![image-20210828105723009](大并发服务器开发Notes.assets/image-20210828105723009.png)
+
+### http响应
+
+![image-20210828105805729](大并发服务器开发Notes.assets/image-20210828105805729.png)
+
+![image-20210828105815268](大并发服务器开发Notes.assets/image-20210828105815268.png)
+
+![image-20210828105820164](大并发服务器开发Notes.assets/image-20210828105820164.png)
+
+### 需要封装的类
+
+1. HttpRequest：http请求类封装
+2. HttpResponse：http响应类封装
+3. HttpContext：http协议解析类封装
+4. HttpServer：http服务器类封装
+
+# muduo库使用示例
+
+## 文件传输示例
+
+## 测量两台机器网络延迟RTT时间
+
+## 聊天服务器
+
+![image-20210830200537366](大并发服务器开发Notes.assets/image-20210830200537366.png)
+
+### 消息格式
+
+![image-20210829192211276](大并发服务器开发Notes.assets/image-20210829192211276.png)
+
+### 消息编解码
+
+![image-20210830105143974](大并发服务器开发Notes.assets/image-20210830105143974.png)
+
+1. **用于处理TCP的粘包问题**
+
+2. 恶意客户端的处理应对
+   - 包头长度为8个字节，但是客户端只发送五个字节。（不完整消息的处理）
+   - 带上一个应用层校验信息。`CRC32`校验
+   - 校验错误，这条消息就是错误的消息。
+   - 服务器端应该有`空闲断开功能`。在一定时间没有收到客户端的消息，就断开这个连接（**时间轮盘**）
+
+### 利用写时拷贝技术减少锁竞争
+
+在多线程版本，每个IO线程进行消息转发的时候，需要加锁访问`connections_`
+
+```c++
+void onStringMessage(const TcpConnectionPtr&,
+                     const string& message,
+                     Timestamp)
+{
+    // 有多个IO线程，因而这里的connections_需要用mutex保护
+    MutexLockGuard lock(mutex_);
+    // 转发消息给所有客户端
+    for (ConnectionList::iterator it = connections_.begin();
+         it != connections_.end();
+         ++it)
+    {
+        codec_.send(get_pointer(*it), message);
+    }
+}
+```
+
+1. 由于mutex的存在，多线程并不能并发执行。而是串行的
+2. 因为存在较高的锁竞争，效率比较低。
+3. 同时，先后到达的两条消息，在转发过程之间的延迟比较大
+
+###   采用threadlocal变量实现高效转发
+
+**存在的问题：**同一条消息，因为是由具体的收到消息的IO线程负责全部转发。这时候，同一条消息到达每个客户端的时间间隔很长。
+
+**解决办法：**采用多线程高效转发
+
+1. 主线程增加一个eventloop列表`loops_`
+2. 每个线程拥有一个threadlocalsingleton变量
+
+### **思考题**
+
+如何保持时序？
+
+- 生产者消费者问题，将到来的消息按照时间排序。业务线程去负责消费和生产
+
+**数据结构：**
+
+1. 消息队列
+2. 信号量用来保证线程同步
+
+## 限制服务器最大并发连接数+踢掉空闲连接
+
+###  限制最大并发连接数
+
+添加一个成员变量，并且在连接到来、连接关闭的时候维护这个数值。
+
+```c++
+void EchoServer::onConnection(const TcpConnectionPtr& conn)
+{
+  LOG_INFO << "EchoServer - " << conn->peerAddress().toIpPort() << " -> "
+           << conn->localAddress().toIpPort() << " is "
+           << (conn->connected() ? "UP" : "DOWN");
+
+  if (conn->connected())
+  {
+    ++numConnected_; // 连接数+1
+    if (numConnected_ > kMaxConnections_)
+    {
+      conn->send("too many connections\r\n", strlen("too many connections\r\n"));
+      conn->shutdown(); // 关闭连接
+    }
+  }
+  else
+  {
+    --numConnected_; // 连接关闭，连接数-1
+  }
+  LOG_INFO << "numConnected = " << numConnected_;
+}
+```
+
+### 用timing wheel踢掉空间连接
+
+![image-20210830201513651](大并发服务器开发Notes.assets/image-20210830201513651.png)
+
+1. 遍历耗时
+2. 文件描述符加倍，占用系统资源
+
+**时间轮盘使用的数据结构**
+
+1. 环形队列、环形缓冲区（head，tail两个指针）
+   - 每个格子是一个hashset，可以容纳不止一个连接
+2. 注册一个每过一秒钟，重复执行的定时器
+3. 每过一秒钟，tail向前移动一格
+4. 并且利用指针指针`shared_ptr/weak_ptr`来管理生命周期
+
+**代码实现**：
+
+```c++
+typedef boost::weak_ptr<muduo::net::TcpConnection> WeakTcpConnectionPtr;
+
+struct Entry : public muduo::copyable
+{
+    explicit Entry(const WeakTcpConnectionPtr& weakConn)
+        : weakConn_(weakConn) // 构造一个entry对象的时候，并不会使得引用计数+1
+        {
+        }
+
+    ~Entry() // 引用计数为0的连接，表示超时，应该被踢掉
+    {
+        muduo::net::TcpConnectionPtr conn = weakConn_.lock();
+        if (conn)
+        {
+            conn->shutdown();
+        }
+    }
+
+    WeakTcpConnectionPtr weakConn_;
+};
+typedef boost::shared_ptr<Entry> EntryPtr;  // set中的元素是一个EntryPtr
+typedef boost::weak_ptr<Entry> WeakEntryPtr;
+typedef boost::unordered_set<EntryPtr> Bucket;  
+// 环形缓冲区每个格子存放的是一个hash_set
+typedef boost::circular_buffer<Bucket> WeakConnectionList;  // 环形缓冲区
+WeakConnectionList connectionBuckets_; // 连接队列环形缓冲区
+```
+
+**对于当前server_所在的主循环，添加一个定时器`loop->runEvery(1.0, boost::bind(&EchoServer::onTimer, this)); // 注册一个1s的定时器`**
+
+1. 当连接到来的时候，创建一个`EntryPtr`对象，并且加入到当前`connectionBuckets_`的tail位置(.back())的哈希集合中，
+2. 打印当前连接数`dumpConnectionBuckets()`
+3. 并且将当前连接的`EntryPtr`的`weak_ptr`作为`tcpConnection`的context，用于消息到来的时候`观察、提升`
+4. 当消息到来的时候，我们将当前tcpconnection的context获取，并且`lock()`提升。如果提升成功。则将当前shared_ptr对象`EntryPtr`插入到当前tail位置的哈希集合尾部。**引用计数+1**
+
+**每隔一秒钟，onTimer也会触发。并且当当前tail指向的元素清空。`push_back(Bucket())；`**这会导致`EntryPtr`引用计数减一，对于减为0的TCPConnection，会调用析构函数`~Entry()`
+
+```c++
+struct Entry : public muduo::copyable
+{
+    explicit Entry(const WeakTcpConnectionPtr& weakConn)
+        : weakConn_(weakConn) // 构造一个entry对象的时候，并不会使得引用计数+1
+        {
+        }
+
+    ~Entry() // 引用计数为0的连接，表示超时，应该被踢掉
+    {
+        muduo::net::TcpConnectionPtr conn = weakConn_.lock();
+        if (conn)
+        {
+            conn->shutdown();
+        }
+    }
+
+    WeakTcpConnectionPtr weakConn_;
+};
+```
+
+### 超时链表：针对第一种方案的优化改进
+
+
+
+### 思考题
+
+1. 如果 TcpConnection::setContext 保存的是强引用EntryPtr，会出现什么情况？  
+
+   > 这样会导致引用计数永远大于等于1，无法踢掉空闲链接
+
+2. 为什么要将Entry 作为 TcpConnection 的 context 保存，如果这里再创建一个新的 Entry 会有什么后果？
+
+   > 如果是重新将tcp连接new一个`Entry`，那么会出现两个引用技术指针。分别引用计数为1，无法实现时间轮盘功能
+
+
 
 # 总结
 
